@@ -17,3 +17,12 @@ node_modules/
 
 # OS
 Thumbs.db
+
+# optional
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# local archives / backups
+standx-mmu-win.zip
+plandB-*mmu_bot.mjs
