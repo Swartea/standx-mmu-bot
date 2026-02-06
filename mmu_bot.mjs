@@ -12,11 +12,10 @@ const PERPS_BASE = "https://perps.standx.com";
 const CHAIN = process.env.CHAIN || "bsc";
 const SYMBOL = process.env.SYMBOL || "BTC-USD";
 
-const QTY_WANT = String(process.env.QTY || "0.0001");
+// qty：只保留一个变量（QTY_WANT），并兼容旧变量名（QTY）
+const QTY_WANT = String(process.env.QTY_WANT || process.env.QTY || "0.0001");
 // 可选：下单数量随机抖动（用于仓位/风险分散）
 const QTY_JITTER_PCT = Number(process.env.QTY_JITTER_PCT || "0"); // 0=关闭；例如 0.15 表示 ±15%
-const QTY_MIN_WANT = String(process.env.QTY_MIN || ""); // 例如 0.0001
-const QTY_MAX_WANT = String(process.env.QTY_MAX || ""); // 例如 0.00013
 const OFFSET_BPS = Number(process.env.OFFSET_BPS || "9");
 const UPDATE_THRESHOLD_BPS = Number(process.env.UPDATE_THRESHOLD_BPS || "1");
 const LOOP_MS = Number(process.env.LOOP_MS || "15000");
@@ -40,6 +39,10 @@ const ABS_MAX_USD = Number(process.env.ABS_MAX_USD || (ABS_SPREAD_USD > 0 ? Stri
 // 订单存活检查与被吃单处理
 const ORDER_CHECK_MS = Number(process.env.ORDER_CHECK_MS || "15000");
 const STOP_ON_FILL = String(process.env.STOP_ON_FILL || "1") === "1"; // 1=被吃单就停机并撤单
+
+// 成交后自动平仓：>0 表示在检测到成交/缺档后，等待 N 秒后用 reduce_only 市价单平仓
+// 0 表示关闭该功能（维持 STOP_ON_FILL 原行为）
+const CLOSE_AFTER_FILL_SEC = Number(process.env.CLOSE_AFTER_FILL_SEC || "0");
 
 // 给下单/撤单都带一个 session id（有些接口/风控会依赖它）
 const SESSION_ID = process.env.SESSION_ID || crypto.randomUUID();
@@ -83,16 +86,13 @@ function roundByDecimals(x, decimals, mode) {
   return r / p;
 }
 
-function pickQtyEach({ qtyBase, minQty, qtyDec, jitterPct, qtyMin, qtyMax }) {
+function pickQtyEach({ qtyBase, minQty, qtyDec, jitterPct }) {
   let q = qtyBase;
 
   if (Number.isFinite(jitterPct) && jitterPct > 0) {
     const u = (Math.random() * 2 - 1); // [-1, 1]
     q = qtyBase * (1 + u * jitterPct);
   }
-
-  if (Number.isFinite(qtyMin)) q = Math.max(q, qtyMin);
-  if (Number.isFinite(qtyMax)) q = Math.min(q, qtyMax);
 
   // 不能低于交易所最小下单量
   q = Math.max(q, minQty);
@@ -192,6 +192,61 @@ async function queryOpenOrders(token) {
   return r.data?.result || [];
 }
 
+async function queryPositions(token) {
+  const r = await axios.get(`${PERPS_BASE}/api/query_positions`, {
+    params: { symbol: SYMBOL },
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  // 文档示例返回数组；这里做兼容
+  const data = r.data;
+  if (Array.isArray(data)) return data;
+  return data?.result || [];
+}
+
+async function closePositionAfterDelay({ token, edPriv, seconds, reason }) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return { skipped: true };
+
+  console.log(new Date().toISOString(), `[CLOSE_SCHEDULED] in ${seconds}s`, "reason", reason);
+  await new Promise(r => setTimeout(r, Math.floor(seconds * 1000)));
+
+  // 再查一次仓位，避免已经手动平掉
+  const positions = await queryPositions(token);
+  const pos =
+    positions.find(p => String(p?.symbol) === SYMBOL && String(p?.status || "").toLowerCase() === "open") ||
+    positions[0];
+
+  const qtyRaw = Number(pos?.qty);
+
+  if (!Number.isFinite(qtyRaw) || qtyRaw === 0) {
+    console.log(new Date().toISOString(), "[CLOSE_SKIPPED] no open position");
+    return { skipped: true };
+  }
+
+  // 约定：qty > 0 为多仓，qty < 0 为空仓（如果实际返回永远为正，你跑一次看日志我再帮你改成用 side 字段）
+  const side = qtyRaw > 0 ? "sell" : "buy";
+  const qtyAbs = Math.abs(qtyRaw);
+
+  // 重要：ALO(post-only) 只能用于 limit 单；平仓这里用 market + reduce_only
+  // 如果全局 TIF=alo，则平仓单必须换成可用的 TIF（这里用 ioc；也可在 .env 里单独配置 CLOSE_TIF）
+  const CLOSE_TIF = process.env.CLOSE_TIF || "ioc";
+  const closeTifToUse = (String(TIF).toLowerCase() === "alo") ? CLOSE_TIF : TIF;
+
+  const body = {
+    symbol: SYMBOL,
+    side,
+    order_type: "market",
+    qty: qtyAbs.toString(),
+    time_in_force: closeTifToUse,
+    reduce_only: true,
+    cl_ord_id: `MMU-CLOSE-${Date.now()}`,
+  };
+
+  const r = await newOrder(token, edPriv, body);
+  console.log(new Date().toISOString(), "[CLOSE_SENT]", "side", side, "qty", qtyAbs, "resp", JSON.stringify(r));
+  return { ok: true, side, qty: qtyAbs, resp: r };
+}
+
 async function cancelOrders(token, edPriv, orderIds) {
   if (!orderIds.length) return;
   const body = { order_id_list: orderIds };
@@ -244,14 +299,16 @@ async function main() {
   console.log("PARAMS:", {
     QTY_WANT,
     QTY_JITTER_PCT,
-    QTY_MIN_WANT,
-    QTY_MAX_WANT,
+    ENV_QTY_WANT: process.env.QTY_WANT,
+    ENV_QTY: process.env.QTY,
     LOOP_MS,
     MIN_REFRESH_MS,
     LADDER_LEVELS,
     LADDER_STEP_BPS,
     ORDER_CHECK_MS,
     STOP_ON_FILL,
+    CLOSE_AFTER_FILL_SEC,
+    CLOSE_TIF: process.env.CLOSE_TIF || "ioc",
     TARGET_BPS,
     MIN_BPS,
     MAX_BPS,
@@ -260,25 +317,15 @@ async function main() {
     ABS_MAX_USD,
   });
 
-// 基础下单量（默认等于 QTY），并支持随机抖动与上下限
+// 基础下单量（默认等于 QTY_WANT），并支持随机抖动
 let qtyBase = Math.max(Number(QTY_WANT), minQty);
 qtyBase = roundByDecimals(qtyBase, qtyDec, "down");
-
-// 可选上下限（未设置则为 NaN，不限制）
-let qtyMin = QTY_MIN_WANT ? Number(QTY_MIN_WANT) : NaN;
-let qtyMax = QTY_MAX_WANT ? Number(QTY_MAX_WANT) : NaN;
-if (Number.isFinite(qtyMin)) qtyMin = roundByDecimals(Math.max(qtyMin, minQty), qtyDec, "down");
-if (Number.isFinite(qtyMax)) qtyMax = roundByDecimals(Math.max(qtyMax, minQty), qtyDec, "down");
-if (Number.isFinite(qtyMin) && Number.isFinite(qtyMax) && qtyMax < qtyMin) {
-  const tmp = qtyMin;
-  qtyMin = qtyMax;
-  qtyMax = tmp;
-}
 
   let lastBid = null;
   let lastAsk = null;
   let lastRefreshTs = 0;
   let lastOrderCheckTs = 0;
+  let closeInProgress = false;
 
   while (true) {
     try {
@@ -323,11 +370,32 @@ if (Number.isFinite(qtyMin) && Number.isFinite(qtyMax) && qtyMax < qtyMin) {
             lastBid = null;
             lastAsk = null;
 
-            // 默认更安全：被吃单就停机，让你手动处理仓位（避免越滚越大）
-            if (STOP_ON_FILL) {
-              console.log(new Date().toISOString(), "Bot stopped due to fill/missing side. Please check Positions and close if needed.");
-              process.exit(2);
+          // 如果启用了“成交后自动平仓”，则等待 N 秒后用 reduce_only 市价单平仓，然后继续跑
+          if (CLOSE_AFTER_FILL_SEC > 0 && !closeInProgress) {
+            closeInProgress = true;
+            try {
+              await closePositionAfterDelay({
+                token,
+                edPriv,
+                seconds: CLOSE_AFTER_FILL_SEC,
+                reason: "fill_or_missing_level",
+              });
+            } catch (e) {
+              console.log(new Date().toISOString(), "[WARN] auto-close failed", e?.response?.data || e?.message || e);
+            } finally {
+              closeInProgress = false;
             }
+
+            // 平仓后强制下一轮重新挂单
+            lastBid = null;
+            lastAsk = null;
+            lastRefreshTs = 0;
+
+          } else if (STOP_ON_FILL) {
+            // 默认更安全：被吃单就停机，让你手动处理仓位（避免越滚越大）
+            console.log(new Date().toISOString(), "Bot stopped due to fill/missing side. Please check Positions and close if needed.");
+            process.exit(2);
+          }
           }
         }
       }
@@ -455,8 +523,6 @@ const ask = askPrices[0];
         minQty,
         qtyDec,
         jitterPct: QTY_JITTER_PCT,
-        qtyMin,
-        qtyMax,
       });
       const tsBase = Date.now();
 const results = [];
