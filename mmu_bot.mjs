@@ -17,7 +17,6 @@ const QTY_WANT = String(process.env.QTY_WANT || process.env.QTY || "0.0001");
 // 可选：下单数量随机抖动（用于仓位/风险分散）
 const QTY_JITTER_PCT = Number(process.env.QTY_JITTER_PCT || "0"); // 0=关闭；例如 0.15 表示 ±15%
 const OFFSET_BPS = Number(process.env.OFFSET_BPS || "9");
-const UPDATE_THRESHOLD_BPS = Number(process.env.UPDATE_THRESHOLD_BPS || "1");
 const LOOP_MS = Number(process.env.LOOP_MS || "15000");
 const TIF = process.env.TIME_IN_FORCE || "alo";
 
@@ -39,6 +38,13 @@ const ABS_MAX_USD = Number(process.env.ABS_MAX_USD || (ABS_SPREAD_USD > 0 ? Stri
 // 订单存活检查与被吃单处理
 const ORDER_CHECK_MS = Number(process.env.ORDER_CHECK_MS || "15000");
 const STOP_ON_FILL = String(process.env.STOP_ON_FILL || "1") === "1"; // 1=被吃单就停机并撤单
+
+// 波动过大时暂停挂单（0=关闭）
+const VOL_PAUSE_BPS = Number(process.env.VOL_PAUSE_BPS || "0");
+const VOL_RESUME_BPS = Number(process.env.VOL_RESUME_BPS || (VOL_PAUSE_BPS > 0 ? String(Math.max(VOL_PAUSE_BPS * 0.5, 5)) : "0"));
+const VOL_PAUSE_MS = Number(process.env.VOL_PAUSE_MS || "60000");
+const VOL_STABLE_TICKS = Math.max(1, Number(process.env.VOL_STABLE_TICKS || "2"));
+const VOL_CANCEL_ON_PAUSE = String(process.env.VOL_CANCEL_ON_PAUSE || "1") === "1";
 
 // 成交后自动平仓：>0 表示在检测到成交/缺档后，等待 N 秒后用 reduce_only 市价单平仓
 // 0 表示关闭该功能（维持 STOP_ON_FILL 原行为）
@@ -104,12 +110,6 @@ function pickQtyEach({ qtyBase, minQty, qtyDec, jitterPct }) {
   return q;
 }
 
-function bpsDiff(a, b) {
-  const mid = (a + b) / 2;
-  if (mid === 0) return 0;
-  return (Math.abs(a - b) / mid) * 10000;
-}
-
 function bidBpsFromMark(mark, bidPrice) {
   // bid 在 mark 下方： (mark - bid)/mark * 10000
   return ((mark - bidPrice) / mark) * 10000;
@@ -126,6 +126,12 @@ function bidUsdFromMark(mark, bidPrice) {
 
 function askUsdFromMark(mark, askPrice) {
   return askPrice - mark;
+}
+
+function bpsDelta(prev, next) {
+  const mid = (prev + next) / 2;
+  if (mid === 0) return 0;
+  return (Math.abs(next - prev) / mid) * 10000;
 }
 
 function normalizeSide(o) {
@@ -189,7 +195,10 @@ async function queryOpenOrders(token) {
     params: { symbol: SYMBOL, limit: 500 },
     headers: { Authorization: `Bearer ${token}` },
   });
-  return r.data?.result || [];
+  // 文档示例有时直接返回数组；这里做兼容
+  const data = r.data;
+  if (Array.isArray(data)) return data;
+  return data?.result || [];
 }
 
 async function queryPositions(token) {
@@ -212,9 +221,9 @@ async function closePositionAfterDelay({ token, edPriv, seconds, reason }) {
 
   // 再查一次仓位，避免已经手动平掉
   const positions = await queryPositions(token);
-  const pos =
-    positions.find(p => String(p?.symbol) === SYMBOL && String(p?.status || "").toLowerCase() === "open") ||
-    positions[0];
+  const pos = positions.find(
+    p => String(p?.symbol) === SYMBOL && String(p?.status || "").toLowerCase() === "open"
+  );
 
   const qtyRaw = Number(pos?.qty);
 
@@ -228,9 +237,9 @@ async function closePositionAfterDelay({ token, edPriv, seconds, reason }) {
   const qtyAbs = Math.abs(qtyRaw);
 
   // 重要：ALO(post-only) 只能用于 limit 单；平仓这里用 market + reduce_only
-  // 如果全局 TIF=alo，则平仓单必须换成可用的 TIF（这里用 ioc；也可在 .env 里单独配置 CLOSE_TIF）
+  // 平仓使用专用 TIF，避免误用只适用于限价单的配置
   const CLOSE_TIF = process.env.CLOSE_TIF || "ioc";
-  const closeTifToUse = (String(TIF).toLowerCase() === "alo") ? CLOSE_TIF : TIF;
+  const closeTifToUse = CLOSE_TIF;
 
   const body = {
     symbol: SYMBOL,
@@ -276,6 +285,16 @@ async function newOrder(token, edPriv, body) {
     },
   });
   return r.data;
+}
+
+async function cancelAllMmuOrders(token, edPriv) {
+  const open = await queryOpenOrders(token);
+  const mine = open.filter(o => (o.cl_ord_id || "").startsWith("MMU-"));
+  const ids = mine.map(o => o.id).filter(Boolean);
+  if (ids.length) {
+    await cancelOrders(token, edPriv, ids);
+  }
+  return ids.length;
 }
 
 async function main() {
@@ -326,11 +345,68 @@ qtyBase = roundByDecimals(qtyBase, qtyDec, "down");
   let lastRefreshTs = 0;
   let lastOrderCheckTs = 0;
   let closeInProgress = false;
+  let lastMark = null;
+  let volPaused = false;
+  let volPauseUntil = 0;
+  let volStableTicks = 0;
 
   while (true) {
     try {
       const mark = await getMarkPrice();
       const now = Date.now();
+      const volBps = (lastMark !== null) ? bpsDelta(lastMark, mark) : 0;
+      lastMark = mark;
+
+      if (VOL_PAUSE_BPS > 0) {
+        if (volBps >= VOL_PAUSE_BPS) {
+          volPauseUntil = now + VOL_PAUSE_MS;
+          volStableTicks = 0;
+          if (!volPaused) {
+            volPaused = true;
+            if (VOL_CANCEL_ON_PAUSE) {
+              try {
+                const n = await cancelAllMmuOrders(token, edPriv);
+                console.log(new Date().toISOString(), "[VOL_PAUSE]", "bps", volBps.toFixed(2), "cancelled", n);
+              } catch (e) {
+                console.log(new Date().toISOString(), "[WARN] vol pause cancel failed", e?.response?.data || e?.message || e);
+              }
+            } else {
+              console.log(new Date().toISOString(), "[VOL_PAUSE]", "bps", volBps.toFixed(2));
+            }
+          } else {
+            console.log(new Date().toISOString(), "[VOL_PAUSE_EXTEND]", "bps", volBps.toFixed(2));
+          }
+        }
+
+        if (volPaused) {
+          if (now < volPauseUntil) {
+            console.log(new Date().toISOString(), "HOLD(vol-pause)", "bps", volBps.toFixed(2));
+            await new Promise(r => setTimeout(r, LOOP_MS));
+            continue;
+          }
+
+          if (volBps <= VOL_RESUME_BPS) {
+            volStableTicks += 1;
+          } else {
+            volStableTicks = 0;
+            volPauseUntil = now + VOL_PAUSE_MS;
+            console.log(new Date().toISOString(), "[VOL_RESUME_WAIT]", "bps", volBps.toFixed(2));
+            await new Promise(r => setTimeout(r, LOOP_MS));
+            continue;
+          }
+
+          if (volStableTicks < VOL_STABLE_TICKS) {
+            console.log(new Date().toISOString(), "[VOL_RESUME_WAIT]", "bps", volBps.toFixed(2), "stable", volStableTicks);
+            await new Promise(r => setTimeout(r, LOOP_MS));
+            continue;
+          }
+
+          volPaused = false;
+          volPauseUntil = 0;
+          volStableTicks = 0;
+          console.log(new Date().toISOString(), "[VOL_RESUME]", "bps", volBps.toFixed(2));
+        }
+      }
 
       // 定期确认：MMU 双边订单是否仍在簿上（防止被吃单/被系统撤单后还以为在线）
       if ((now - lastOrderCheckTs) >= ORDER_CHECK_MS) {
