@@ -30,11 +30,6 @@ const LADDER_LEVELS = Math.max(1, Number(process.env.LADDER_LEVELS || "1"));
 // BPS 模式：每一档在 TARGET_BPS 基础上向外增加的间隔（bps）
 const LADDER_STEP_BPS = Number(process.env.LADDER_STEP_BPS || "0.25");
 
-// 绝对美元价差模式：如果 ABS_SPREAD_USD>0，则优先使用“±美元”而不是 bps
-const ABS_SPREAD_USD = Number(process.env.ABS_SPREAD_USD || "0"); // 例如 1000 表示 bid=mark-1000, ask=mark+1000
-const ABS_MIN_USD = Number(process.env.ABS_MIN_USD || (ABS_SPREAD_USD > 0 ? String(Math.max(ABS_SPREAD_USD * 0.3, 50)) : "0"));
-const ABS_MAX_USD = Number(process.env.ABS_MAX_USD || (ABS_SPREAD_USD > 0 ? String(Math.max(ABS_SPREAD_USD * 1.5, ABS_SPREAD_USD + 50)) : "0"));
-
 // 订单存活检查与被吃单处理
 const ORDER_CHECK_MS = Number(process.env.ORDER_CHECK_MS || "15000");
 const STOP_ON_FILL = String(process.env.STOP_ON_FILL || "1") === "1"; // 1=被吃单就停机并撤单
@@ -118,14 +113,6 @@ function bidBpsFromMark(mark, bidPrice) {
 function askBpsFromMark(mark, askPrice) {
   // ask 在 mark 上方： (ask - mark)/mark * 10000
   return ((askPrice - mark) / mark) * 10000;
-}
-
-function bidUsdFromMark(mark, bidPrice) {
-  return mark - bidPrice;
-}
-
-function askUsdFromMark(mark, askPrice) {
-  return askPrice - mark;
 }
 
 function bpsDelta(prev, next) {
@@ -311,10 +298,7 @@ async function main() {
   console.log("SYMBOL:", SYMBOL, "TIF:", TIF);
   console.log("min_order_qty:", minQty, "price_tick_decimals:", priceDec, "qty_tick_decimals:", qtyDec);
   console.log("CWD:", process.cwd());
-  console.log(
-    "MODE:",
-    ABS_SPREAD_USD > 0 ? `USD(±${ABS_SPREAD_USD}$)` : `BPS(target=${TARGET_BPS}, band=[${MIN_BPS}, ${MAX_BPS}])`
-  );
+  console.log("MODE:", `BPS(target=${TARGET_BPS}, band=[${MIN_BPS}, ${MAX_BPS}])`);
   console.log("PARAMS:", {
     QTY_WANT,
     QTY_JITTER_PCT,
@@ -331,9 +315,6 @@ async function main() {
     TARGET_BPS,
     MIN_BPS,
     MAX_BPS,
-    ABS_SPREAD_USD,
-    ABS_MIN_USD,
-    ABS_MAX_USD,
   });
 
 // 基础下单量（默认等于 QTY_WANT），并支持随机抖动
@@ -366,6 +347,9 @@ qtyBase = roundByDecimals(qtyBase, qtyDec, "down");
             if (VOL_CANCEL_ON_PAUSE) {
               try {
                 const n = await cancelAllMmuOrders(token, edPriv);
+                // 强制下一轮刷新，避免取消后仍误以为挂单存在
+                lastBid = null;
+                lastAsk = null;
                 console.log(new Date().toISOString(), "[VOL_PAUSE]", "bps", volBps.toFixed(2), "cancelled", n);
               } catch (e) {
                 console.log(new Date().toISOString(), "[WARN] vol pause cancel failed", e?.response?.data || e?.message || e);
@@ -479,76 +463,38 @@ qtyBase = roundByDecimals(qtyBase, qtyDec, "down");
       // 如果已经有上一轮挂单价格，优先判断它们是否仍在允许波动区间内
       let refreshReason = "out-of-band";
       if (lastBid !== null && lastAsk !== null) {
-        if (ABS_SPREAD_USD > 0) {
-          const bidUsd = bidUsdFromMark(mark, lastBid);
-          const askUsd = askUsdFromMark(mark, lastAsk);
-          const tooCloseUsd = (bidUsd < ABS_MIN_USD) || (askUsd < ABS_MIN_USD);
+        const bidBps = bidBpsFromMark(mark, lastBid);
+        const askBps = askBpsFromMark(mark, lastAsk);
+        const tooClose = (bidBps < MIN_BPS) || (askBps < MIN_BPS);
 
-          // 只要在 [ABS_MIN_USD, ABS_MAX_USD] 区间内，就不刷新（减少撤挂，也避免太贴近被吃单）
-          if (!tooCloseUsd && bidUsd <= ABS_MAX_USD && askUsd <= ABS_MAX_USD) {
-            console.log(
-              new Date().toISOString(),
-              "HOLD(band-usd)",
-              "mark", mark.toFixed(2),
-              "bid", lastBid, `(${bidUsd.toFixed(2)}$)`,
-              "ask", lastAsk, `(${askUsd.toFixed(2)}$)`,
-              "qty", qtyBase
-            );
-            await new Promise(r => setTimeout(r, LOOP_MS));
-            continue;
-          }
+        // 只要在 [MIN_BPS, MAX_BPS] 区间内，就不刷新（既改减少撤挂，也避免太贴近被吃单）
+        if (!tooClose && bidBps <= MAX_BPS && askBps <= MAX_BPS) {
+          console.log(
+            new Date().toISOString(),
+            "HOLD(band)",
+            "mark", mark.toFixed(2),
+            "bid", lastBid, `(${bidBps.toFixed(2)}bps)`,
+            "ask", lastAsk, `(${askBps.toFixed(2)}bps)`,
+            "qty", qtyBase
+          );
+          await new Promise(r => setTimeout(r, LOOP_MS));
+          continue;
+        }
 
-          if (tooCloseUsd) refreshReason = "too-close-usd";
+        if (tooClose) refreshReason = "too-close";
 
-          // 防抖：如果刚刷新不久，且仍在合理范围内，并且不属于“太贴近”，就先不刷
-          if (!tooCloseUsd && (now - lastRefreshTs) < MIN_REFRESH_MS && bidUsd < (ABS_MAX_USD || Infinity) && askUsd < (ABS_MAX_USD || Infinity)) {
-            console.log(
-              new Date().toISOString(),
-              "HOLD(min-interval-usd)",
-              "mark", mark.toFixed(2),
-              "bid", lastBid, `(${bidUsd.toFixed(2)}$)`,
-              "ask", lastAsk, `(${askUsd.toFixed(2)}$)`,
-              "qty", qtyBase
-            );
-            await new Promise(r => setTimeout(r, LOOP_MS));
-            continue;
-          }
-
-          refreshReason = refreshReason === "out-of-band" ? "out-of-band-usd" : refreshReason;
-        } else {
-          const bidBps = bidBpsFromMark(mark, lastBid);
-          const askBps = askBpsFromMark(mark, lastAsk);
-          const tooClose = (bidBps < MIN_BPS) || (askBps < MIN_BPS);
-
-          // 只要在 [MIN_BPS, MAX_BPS] 区间内，就不刷新（既改减少撤挂，也避免太贴近被吃单）
-          if (!tooClose && bidBps <= MAX_BPS && askBps <= MAX_BPS) {
-            console.log(
-              new Date().toISOString(),
-              "HOLD(band)",
-              "mark", mark.toFixed(2),
-              "bid", lastBid, `(${bidBps.toFixed(2)}bps)`,
-              "ask", lastAsk, `(${askBps.toFixed(2)}bps)`,
-              "qty", qtyBase
-            );
-            await new Promise(r => setTimeout(r, LOOP_MS));
-            continue;
-          }
-
-          if (tooClose) refreshReason = "too-close";
-
-          // 防抖：如果刚刷新不久，且仍在 10bps 内，并且不属于“太贴近”场景，就先不刷
-          if (!tooClose && (now - lastRefreshTs) < MIN_REFRESH_MS && bidBps < 10 && askBps < 10) {
-            console.log(
-              new Date().toISOString(),
-              "HOLD(min-interval)",
-              "mark", mark.toFixed(2),
-              "bid", lastBid, `(${bidBps.toFixed(2)}bps)`,
-              "ask", lastAsk, `(${askBps.toFixed(2)}bps)`,
-              "qty", qtyBase
-            );
-            await new Promise(r => setTimeout(r, LOOP_MS));
-            continue;
-          }
+        // 防抖：如果刚刷新不久，且仍在 10bps 内，并且不属于“太贴近”场景，就先不刷
+        if (!tooClose && (now - lastRefreshTs) < MIN_REFRESH_MS && bidBps < 10 && askBps < 10) {
+          console.log(
+            new Date().toISOString(),
+            "HOLD(min-interval)",
+            "mark", mark.toFixed(2),
+            "bid", lastBid, `(${bidBps.toFixed(2)}bps)`,
+            "ask", lastAsk, `(${askBps.toFixed(2)}bps)`,
+            "qty", qtyBase
+          );
+          await new Promise(r => setTimeout(r, LOOP_MS));
+          continue;
         }
       }
 
@@ -557,24 +503,14 @@ const levels = LADDER_LEVELS;
 const bidPrices = [];
 const askPrices = [];
 
-// 根据模式生成每一档的价格
+// BPS 模式：以 TARGET_BPS 为第 1 档，往外每档增加 LADDER_STEP_BPS，但不超过 MAX_BPS
 for (let i = 0; i < levels; i++) {
-  if (ABS_SPREAD_USD > 0) {
-    // USD 模式：以 ABS_SPREAD_USD 为第 1 档，往外每档增加 100 美元（可通过 .env 增加 ABS_STEP_USD 时再扩展）
-    const offUsd = Math.max(1, ABS_SPREAD_USD + i * 100);
-    const b = roundByDecimals(mark - offUsd, priceDec, "down");
-    const a = roundByDecimals(mark + offUsd, priceDec, "up");
-    bidPrices.push(b);
-    askPrices.push(a);
-  } else {
-    // BPS 模式：以 TARGET_BPS 为第 1 档，往外每档增加 LADDER_STEP_BPS，但不超过 MAX_BPS
-    const offBps = Math.max(0.01, Math.min(MAX_BPS, TARGET_BPS + i * LADDER_STEP_BPS));
-    const off = mark * (offBps / 10000);
-    const b = roundByDecimals(mark - off, priceDec, "down");
-    const a = roundByDecimals(mark + off, priceDec, "up");
-    bidPrices.push(b);
-    askPrices.push(a);
-  }
+  const offBps = Math.max(0.01, Math.min(MAX_BPS, TARGET_BPS + i * LADDER_STEP_BPS));
+  const off = mark * (offBps / 10000);
+  const b = roundByDecimals(mark - off, priceDec, "down");
+  const a = roundByDecimals(mark + off, priceDec, "up");
+  bidPrices.push(b);
+  askPrices.push(a);
 }
 
 // 兜底：避免 ask<=bid（极端 tick 情况）
@@ -643,33 +579,18 @@ lastBid = bid;
 lastAsk = ask;
 lastRefreshTs = Date.now();
 
-      if (ABS_SPREAD_USD > 0) {
-        const bidUsdNow = bidUsdFromMark(mark, bid);
-        const askUsdNow = askUsdFromMark(mark, ask);
-        console.log(
-          new Date().toISOString(),
-          `REFRESH(${refreshReason})`,
-          "mark", mark.toFixed(2),
-          "bid", bid, `(${bidUsdNow.toFixed(2)}$)`,
-          "ask", ask, `(${askUsdNow.toFixed(2)}$)`,
-          "levels", levels,
-          "orders", JSON.stringify(results),
-          "qty_each", qtyEach
-        );
-      } else {
-        const bidBpsNow = bidBpsFromMark(mark, bid);
-        const askBpsNow = askBpsFromMark(mark, ask);
-        console.log(
-          new Date().toISOString(),
-          `REFRESH(${refreshReason})`,
-          "mark", mark.toFixed(2),
-          "bid", bid, `(${bidBpsNow.toFixed(2)}bps)`,
-          "ask", ask, `(${askBpsNow.toFixed(2)}bps)`,
-          "levels", levels,
-          "orders", JSON.stringify(results),
-          "qty_each", qtyEach
-        );
-      }
+      const bidBpsNow = bidBpsFromMark(mark, bid);
+      const askBpsNow = askBpsFromMark(mark, ask);
+      console.log(
+        new Date().toISOString(),
+        `REFRESH(${refreshReason})`,
+        "mark", mark.toFixed(2),
+        "bid", bid, `(${bidBpsNow.toFixed(2)}bps)`,
+        "ask", ask, `(${askBpsNow.toFixed(2)}bps)`,
+        "levels", levels,
+        "orders", JSON.stringify(results),
+        "qty_each", qtyEach
+      );
     } catch (e) {
       console.log(new Date().toISOString(), "[ERR]", e?.response?.data || e?.message || e);
     }
