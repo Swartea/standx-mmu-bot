@@ -26,3 +26,6 @@ yarn-error.log*
 # local archives / backups
 standx-mmu-win.zip
 plandB-*mmu_bot.mjs
+
+# local multi-account copies
+instances/

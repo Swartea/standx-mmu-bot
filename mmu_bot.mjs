@@ -5,12 +5,14 @@ import crypto from "node:crypto";
 import axios from "axios";
 import { ethers } from "ethers";
 import { ed25519 } from "@noble/curves/ed25519.js";
+import { SocksProxyAgent } from "socks-proxy-agent";
 
 const API_BASE = "https://api.standx.com/v1/offchain";
 const PERPS_BASE = "https://perps.standx.com";
 
 const CHAIN = process.env.CHAIN || "bsc";
 const SYMBOL = process.env.SYMBOL || "BTC-USD";
+const PROXY_URL = process.env.PROXY_URL || "";
 
 // qty：只保留一个变量（QTY_WANT），并兼容旧变量名（QTY）
 const QTY_WANT = String(process.env.QTY_WANT || process.env.QTY || "0.0001");
@@ -50,6 +52,16 @@ const SESSION_ID = process.env.SESSION_ID || crypto.randomUUID();
 
 const PRIV = process.env.WALLET_PRIVATE_KEY;
 if (!PRIV || !PRIV.startsWith("0x")) throw new Error("Missing WALLET_PRIVATE_KEY in .env");
+
+let http = axios;
+if (PROXY_URL) {
+  const agent = new SocksProxyAgent(PROXY_URL);
+  http = axios.create({
+    httpAgent: agent,
+    httpsAgent: agent,
+    proxy: false,
+  });
+}
 
 function parseJwtPayload(jwt) {
   const base64Url = jwt.split(".")[1];
@@ -129,14 +141,14 @@ function normalizeSide(o) {
 }
 
 async function getSymbolInfo() {
-  const r = await axios.get(`${PERPS_BASE}/api/query_symbol_info`, { params: { symbol: SYMBOL } });
+  const r = await http.get(`${PERPS_BASE}/api/query_symbol_info`, { params: { symbol: SYMBOL } });
   const s = Array.isArray(r.data) ? r.data.find(x => x.symbol === SYMBOL) : null;
   if (!s) throw new Error("query_symbol_info unexpected: " + JSON.stringify(r.data).slice(0, 200));
   return s;
 }
 
 async function getMarkPrice() {
-  const r = await axios.get(`${PERPS_BASE}/api/query_symbol_price`, { params: { symbol: SYMBOL } });
+  const r = await http.get(`${PERPS_BASE}/api/query_symbol_price`, { params: { symbol: SYMBOL } });
   const mp = r.data?.mark_price ?? r.data?.index_price;
   const mark = Number(mp);
   if (!Number.isFinite(mark) || mark <= 0) throw new Error("bad mark price: " + JSON.stringify(r.data));
@@ -149,7 +161,7 @@ async function authToken({ requestId }) {
 
   const wallet = new ethers.Wallet(PRIV);
 
-  const prep = await axios.post(
+  const prep = await http.post(
     `${API_BASE}/prepare-signin?chain=${CHAIN}`,
     { address: wallet.address, requestId },
     { headers: { "Content-Type": "application/json" } }
@@ -164,7 +176,7 @@ async function authToken({ requestId }) {
 
   const signature = await wallet.signMessage(message);
 
-  const login = await axios.post(
+  const login = await http.post(
     `${API_BASE}/login?chain=${CHAIN}`,
     { signature, signedData, expiresSeconds: 604800 },
     { headers: { "Content-Type": "application/json" } }
@@ -178,7 +190,7 @@ async function authToken({ requestId }) {
 }
 
 async function queryOpenOrders(token) {
-  const r = await axios.get(`${PERPS_BASE}/api/query_open_orders`, {
+  const r = await http.get(`${PERPS_BASE}/api/query_open_orders`, {
     params: { symbol: SYMBOL, limit: 500 },
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -189,7 +201,7 @@ async function queryOpenOrders(token) {
 }
 
 async function queryPositions(token) {
-  const r = await axios.get(`${PERPS_BASE}/api/query_positions`, {
+  const r = await http.get(`${PERPS_BASE}/api/query_positions`, {
     params: { symbol: SYMBOL },
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -249,7 +261,7 @@ async function cancelOrders(token, edPriv, orderIds) {
   const payloadStr = JSON.stringify(body);
   const sigHeaders = signBody(edPriv, payloadStr);
 
-  await axios.post(`${PERPS_BASE}/api/cancel_orders`, payloadStr, {
+  await http.post(`${PERPS_BASE}/api/cancel_orders`, payloadStr, {
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,
@@ -263,7 +275,7 @@ async function newOrder(token, edPriv, body) {
   const payloadStr = JSON.stringify(body);
   const sigHeaders = signBody(edPriv, payloadStr);
 
-  const r = await axios.post(`${PERPS_BASE}/api/new_order`, payloadStr, {
+  const r = await http.post(`${PERPS_BASE}/api/new_order`, payloadStr, {
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${token}`,

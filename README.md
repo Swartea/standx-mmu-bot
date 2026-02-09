@@ -118,6 +118,17 @@ STOP_ON_FILL=1
 ```
 
 ## 进阶参数（按需）
+### 代理（多 IP）
+每个账号可使用一个独立代理出口，便于账号隔离。  
+在 `.env` 设置：
+```
+PROXY_URL=socks5://127.0.0.1:1081
+```
+示例（本机通过 SSH 建立 SOCKS5 代理）：
+```bash
+ssh -N -D 1081 user@your-vps-ip
+```
+
 ### BPS 模式
 ```
 TARGET_BPS=9
